@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Soft action guidance framework — classifies LLM behaviors and recommends (not forces) downstream actions"
 requires-python = ">=3.11"
 dependencies = [
+    "mcp>=1.26.0",
     "pydantic>=2.0",
 ]
 

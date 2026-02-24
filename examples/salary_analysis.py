@@ -1,7 +1,7 @@
 """Salary analysis example — same problem as action-chain for comparison.
 
 Outputs TRACE.md with full execution trace, transition matrix,
-adherence rate, and cost per action type.
+plan adherence rate, and cost per action type.
 
 Usage:
     uv run python examples/salary_analysis.py
@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import statistics
 import sys
 from pathlib import Path
 
 # Add project root to path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.core.action_type import default_salary_catalog
 from src.core.context import ExecutionContext
@@ -25,39 +25,17 @@ from src.llm.claude import ClaudeProvider
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+MCP_SERVER = str(PROJECT_ROOT / "tools" / "mcp_server.py")
+
 
 def build_engine() -> Engine:
-    """Build engine with salary analysis catalog and tools."""
+    """Build engine with salary analysis catalog and MCP tools."""
     catalog = default_salary_catalog()
     engine = Engine(catalog)
-
-    def calc(expression: str) -> str:
-        allowed = set("0123456789+-*/.() ,")
-        if not all(c in allowed for c in expression):
-            return f"Error: invalid characters in expression"
-        try:
-            return str(eval(expression))
-        except Exception as e:
-            return f"Error: {e}"
-
-    def compound(base: float, rate: float, years: int) -> str:
-        result = base * ((1 + rate) ** years)
-        return f"{result:.2f}"
-
-    def stats(values: list[float]) -> str:
-        if not values:
-            return "Error: empty list"
-        if len(values) == 1:
-            return f"mean={values[0]:.2f}, median={values[0]:.2f}, stdev=0.00"
-        return (
-            f"mean={statistics.mean(values):.2f}, "
-            f"median={statistics.median(values):.2f}, "
-            f"stdev={statistics.stdev(values):.2f}"
-        )
-
-    engine.register_tool("calc", calc, "Evaluate arithmetic: calc(expression='2+3')")
-    engine.register_tool("compound", compound, "Compound interest: compound(base=100000, rate=0.05, years=4)")
-    engine.register_tool("stats", stats, "Statistics: stats(values=[1.0, 2.0, 3.0])")
+    engine.register_mcp_server(
+        "chain-tools",
+        ["uv", "run", "--directory", str(PROJECT_ROOT), "python", MCP_SERVER],
+    )
     return engine
 
 
@@ -72,23 +50,32 @@ def generate_trace(ctx: ExecutionContext) -> str:
         "",
     ]
 
+    # Generated plan
+    if ctx.plan:
+        lines.append("## Generated Plan")
+        lines.append("")
+        for i, step_info in enumerate(ctx.plan, 1):
+            at = step_info.get("action_type", "?")
+            desc = step_info.get("description", "")
+            lines.append(f"{i}. **{at}**: {desc}")
+        lines.append("")
+
     # Step-by-step trace
     lines.append("## Step-by-Step Trace")
     lines.append("")
     for i, step in enumerate(ctx.steps, 1):
-        lines.append(f"### Step {i}: [{step.action_type}]")
+        planned_str = f" (planned: `{step.planned_type}`)" if step.planned_type else ""
+        lines.append(f"### Step {i}: [{step.action_type}]{planned_str}")
         lines.append("")
         lines.append(f"**Thinking**: {step.thinking}")
         lines.append("")
         lines.append(f"**Response**: {step.response[:200]}{'...' if len(step.response) > 200 else ''}")
         lines.append("")
-        if step.tool_name:
-            lines.append(f"**Tool**: `{step.tool_name}({step.tool_args})`")
-            lines.append(f"**Result**: `{step.tool_result}`")
+        if step.tool_calls:
+            lines.append(f"**Tool Calls** ({len(step.tool_calls)}):")
             lines.append("")
-        if step.recommendation:
-            followed = "Yes" if step.followed_recommendation else "No"
-            lines.append(f"**Recommendation**: {step.recommendation} | **Followed**: {followed}")
+            for tc in step.tool_calls:
+                lines.append(f"- `{tc['name']}({tc.get('args', {})})` → `{tc.get('result', 'N/A')}`")
             lines.append("")
         lines.append("---")
         lines.append("")
@@ -125,12 +112,13 @@ def generate_trace(ctx: ExecutionContext) -> str:
         lines.append("No transitions recorded.")
     lines.append("")
 
-    # Adherence rate
-    lines.append("## Adherence Rate")
-    lines.append("")
-    rate = ctx.adherence_rate()
-    lines.append(f"**{rate:.0%}** of steps followed the recommended action type.")
-    lines.append("")
+    # Plan adherence rate
+    if ctx.plan:
+        lines.append("## Plan Adherence Rate")
+        lines.append("")
+        plan_rate = ctx.plan_adherence_rate()
+        lines.append(f"**{plan_rate:.0%}** of steps matched the plan's expected action type.")
+        lines.append("")
 
     # Cost per action type
     lines.append("## Cost per Action Type")
@@ -152,11 +140,12 @@ def generate_trace(ctx: ExecutionContext) -> str:
     lines.append("| Aspect | action-chain (hard FSM) | chain-of-action (soft guidance) |")
     lines.append("|---|---|---|")
     lines.append("| State control | Enum-enforced transitions | LLM self-classifies freely |")
-    lines.append("| Tool access | Whitelisted per state | All tools always available |")
+    lines.append("| Tool access | Whitelisted per state | MCP tools always available |")
     lines.append("| Flexibility | Rigid: must follow graph | Flexible: recommendations only |")
     lines.append(f"| Steps taken | (run action-chain for comparison) | {len(ctx.steps)} |")
     lines.append(f"| Total cost | (run action-chain for comparison) | ${total_cost:.4f} |")
-    lines.append(f"| Adherence rate | N/A (forced) | {rate:.0%} |")
+    if ctx.plan:
+        lines.append(f"| Plan adherence | N/A | {ctx.plan_adherence_rate():.0%} |")
     lines.append("")
 
     return "\n".join(lines)
@@ -186,20 +175,25 @@ async def main():
     print(f"\n{'='*60}")
     print(f"RESULTS")
     print(f"{'='*60}")
+    if ctx.plan:
+        plan_summary = " → ".join(s.get("action_type", "?") for s in ctx.plan)
+        print(f"Plan: {plan_summary}")
     print(f"Total steps: {len(ctx.steps)}")
     print(f"Action types: {ctx.action_type_counts()}")
-    print(f"Adherence rate: {ctx.adherence_rate():.0%}")
+    if ctx.plan:
+        print(f"Plan adherence: {ctx.plan_adherence_rate():.0%}")
     print()
 
     for i, step in enumerate(ctx.steps, 1):
-        rec_str = ""
-        if step.recommendation:
-            rec_str = f" (rec: {step.recommendation}, followed: {step.followed_recommendation})"
-        tool_str = f" → {step.tool_name}({step.tool_args})" if step.tool_name else ""
-        print(f"  Step {i}: [{step.action_type}]{tool_str}{rec_str}")
+        planned_str = f" [planned: {step.planned_type}]" if step.planned_type else ""
+        tool_str = ""
+        if step.tool_calls:
+            names = [tc["name"] for tc in step.tool_calls]
+            tool_str = f" → tools: {', '.join(names)}"
+        print(f"  Step {i}: [{step.action_type}]{planned_str}{tool_str}")
 
     # Write TRACE.md
-    trace_path = Path(__file__).resolve().parent.parent / "TRACE.md"
+    trace_path = PROJECT_ROOT / "TRACE.md"
     trace_content = generate_trace(ctx)
     trace_path.write_text(trace_content)
     print(f"\nTrace written to: {trace_path}")

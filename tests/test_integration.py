@@ -1,9 +1,8 @@
 """Integration tests — requires real Claude CLI. Skip when inside Claude Code."""
 from __future__ import annotations
 
-import math
 import os
-import statistics
+from pathlib import Path
 
 import pytest
 
@@ -17,38 +16,18 @@ pytestmark = pytest.mark.skipif(
     reason="Skipping integration tests inside Claude Code",
 )
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MCP_SERVER = str(PROJECT_ROOT / "tools" / "mcp_server.py")
+
 
 def _make_salary_engine() -> Engine:
-    """Build an engine with the salary analysis catalog and tools."""
+    """Build an engine with the salary analysis catalog and MCP tools."""
     catalog = default_salary_catalog()
     engine = Engine(catalog)
-
-    def calc(expression: str) -> str:
-        allowed = set("0123456789+-*/.() ,")
-        if not all(c in allowed for c in expression):
-            return f"Error: invalid characters in expression"
-        try:
-            return str(eval(expression))
-        except Exception as e:
-            return f"Error: {e}"
-
-    def compound(base: float, rate: float, years: int) -> str:
-        result = base * ((1 + rate) ** years)
-        return f"{result:.2f}"
-
-    def stats(values: list[float]) -> str:
-        if not values:
-            return "Error: empty list"
-        return (
-            f"mean={statistics.mean(values):.2f}, "
-            f"median={statistics.median(values):.2f}, "
-            f"stdev={statistics.stdev(values):.2f}" if len(values) > 1
-            else f"mean={values[0]:.2f}, median={values[0]:.2f}, stdev=0.00"
-        )
-
-    engine.register_tool("calc", calc, "Evaluate arithmetic expression: calc(expression='2+3')")
-    engine.register_tool("compound", compound, "Compound interest: compound(base=100000, rate=0.05, years=4)")
-    engine.register_tool("stats", stats, "Statistics: stats(values=[1.0, 2.0, 3.0])")
+    engine.register_mcp_server(
+        "chain-tools",
+        ["uv", "run", "--directory", str(PROJECT_ROOT), "python", MCP_SERVER],
+    )
     return engine
 
 
@@ -73,7 +52,7 @@ async def test_simple_qa():
 
 @pytest.mark.integration
 async def test_salary_analysis():
-    """Full salary analysis with tools — multiple compute/verify cycles expected."""
+    """Full salary analysis with MCP tools — multiple compute/verify cycles expected."""
     engine = _make_salary_engine()
     llm = ClaudeProvider(model="haiku")
 
@@ -88,9 +67,9 @@ async def test_salary_analysis():
 
     ctx = await engine.run(task, llm, max_turns=15)
 
-    # Should have used tools
-    tool_steps = [s for s in ctx.steps if s.tool_name]
-    assert len(tool_steps) >= 2, f"Expected tool use, got {len(tool_steps)} tool steps"
+    # Should have used MCP tools
+    tool_steps = [s for s in ctx.steps if s.tool_calls]
+    assert len(tool_steps) >= 1, f"Expected MCP tool use, got {len(tool_steps)} tool steps"
 
     # Should reach done
     assert ctx.steps[-1].action_type == "done" or any(
@@ -101,10 +80,23 @@ async def test_salary_analysis():
     counts = ctx.action_type_counts()
     assert len(counts) >= 2, f"Expected multiple action types, got: {counts}"
 
+    # Plan should be generated and end with "done"
+    assert ctx.plan, "Expected a non-empty plan"
+    assert ctx.plan[-1].get("action_type") == "done", f"Plan should end with 'done', got: {ctx.plan}"
+
+    # Plan adherence rate should be computable
+    plan_rate = ctx.plan_adherence_rate()
+    assert 0.0 <= plan_rate <= 1.0
+
+    # Each step should have planned_type populated (if plan covers it)
+    for i, step in enumerate(ctx.steps):
+        if i < len(ctx.plan):
+            assert step.planned_type is not None, f"Step {i} missing planned_type"
+
 
 @pytest.mark.integration
-async def test_adherence_tracking():
-    """Verify that recommendation/followed fields are populated."""
+async def test_cost_tracking():
+    """Verify that cost stats are populated after a run."""
     engine = _make_salary_engine()
     llm = ClaudeProvider(model="haiku")
 
@@ -114,16 +106,6 @@ async def test_adherence_tracking():
     )
 
     ctx = await engine.run(task, llm, max_turns=10)
-
-    # After first step, all steps should have recommendations populated
-    for step in ctx.steps[1:]:
-        # recommendation might be empty if previous type has no suggestions
-        assert isinstance(step.recommendation, list)
-        assert isinstance(step.followed_recommendation, bool)
-
-    # adherence_rate should be computable
-    rate = ctx.adherence_rate()
-    assert 0.0 <= rate <= 1.0
 
     # Cost stats should be populated
     assert len(ctx.cost_stats) > 0

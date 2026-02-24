@@ -12,18 +12,32 @@ class ActionStep:
     action_type: str                     # Self-declared by LLM
     thinking: str = ""
     response: str = ""
-    tool_name: str | None = None
-    tool_args: dict[str, Any] | None = None
-    tool_result: str | None = None
-    recommendation: list[str] = field(default_factory=list)  # What we suggested
-    followed_recommendation: bool = True                     # Did LLM follow?
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)  # [{name, args, result}]
+    planned_type: str | None = None                          # What the plan expected at this position
     cost: TokenStats | None = None
+
+    @property
+    def tool_name(self) -> str | None:
+        """First tool called in this step (backward compat)."""
+        return self.tool_calls[0]["name"] if self.tool_calls else None
+
+    @property
+    def tool_args(self) -> dict[str, Any] | None:
+        """First tool's args (backward compat)."""
+        return self.tool_calls[0].get("args") if self.tool_calls else None
+
+    @property
+    def tool_result(self) -> str | None:
+        """First tool's result (backward compat)."""
+        return self.tool_calls[0].get("result") if self.tool_calls else None
 
 
 @dataclass
 class ExecutionContext:
     """Tracks the full execution state of a chain-of-action run."""
     task: str
+    plan: list[dict[str, str]] = field(default_factory=list)  # Generated plan: [{action_type, description}]
+    plan_cursor: int = 0                                    # Current position in plan
     steps: list[ActionStep] = field(default_factory=list)
     turn_count: int = 0
     cost_stats: dict[str, TokenStats] = field(default_factory=dict)
@@ -46,13 +60,12 @@ class ExecutionContext:
             matrix[src][dst] = matrix[src].get(dst, 0) + 1
         return matrix
 
-    def adherence_rate(self) -> float:
-        """Percentage of steps that followed the recommendation."""
-        if not self.steps:
+    def plan_adherence_rate(self) -> float:
+        """Percentage of execution steps that matched the plan's expected action type."""
+        if not self.plan or not self.steps:
             return 0.0
-        # Skip first step (no prior recommendation)
-        steps_with_rec = [s for s in self.steps[1:] if s.recommendation]
-        if not steps_with_rec:
-            return 1.0
-        followed = sum(1 for s in steps_with_rec if s.followed_recommendation)
-        return followed / len(steps_with_rec)
+        matches = 0
+        for i, step in enumerate(self.steps):
+            if i < len(self.plan) and step.action_type == self.plan[i].get("action_type"):
+                matches += 1
+        return matches / len(self.steps)

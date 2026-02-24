@@ -1,36 +1,42 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any
 
 from src.core.action_type import ActionCatalog
-from src.core.advisor import ActionAdvisor, ToolDef
+from src.core.advisor import ActionAdvisor
 from src.core.context import ActionStep, ExecutionContext
 from src.llm.base import LLMProvider
 from src.monitoring.tracker import TokenTracker
 
 logger = logging.getLogger(__name__)
 
+# Default MCP server path (relative to project root)
+_DEFAULT_MCP_SERVER = Path(__file__).resolve().parent.parent.parent / "tools" / "mcp_server.py"
+
 
 class Engine:
     """Main execution loop for chain-of-action.
 
-    Calls LLM -> classifies action -> executes tool -> recommends next -> repeat.
-    All tools are always available. Recommendations are soft guidance.
+    Two-phase loop: plan generation → guided execution.
+    Tools are executed natively by Claude CLI via MCP servers.
     """
 
     def __init__(self, catalog: ActionCatalog) -> None:
         self._catalog = catalog
-        self._tools: dict[str, ToolDef] = {}
+        self._mcp_server_name: str | None = None
+        self._mcp_command: list[str] | None = None
 
-    def register_tool(
-        self,
-        name: str,
-        func: Callable[..., str],
-        description: str,
-    ) -> None:
-        """Register a tool that the LLM can call."""
-        self._tools[name] = ToolDef(name=name, description=description, func=func)
+    def register_mcp_server(self, name: str, command: list[str]) -> None:
+        """Register an MCP server for tool execution.
+
+        Args:
+            name: Unique server name for this session.
+            command: Command to start the server, e.g. ["uv", "run", "python", "tools/mcp_server.py"].
+        """
+        self._mcp_server_name = name
+        self._mcp_command = command
 
     async def run(
         self,
@@ -38,24 +44,61 @@ class Engine:
         llm: LLMProvider,
         max_turns: int = 20,
     ) -> ExecutionContext:
-        """Execute the chain-of-action loop."""
-        advisor = ActionAdvisor(self._catalog, self._tools)
+        """Execute the two-phase chain-of-action loop.
+
+        Phase 1 (turn 0): Generate an execution plan from the catalog.
+        Phase 2 (turns 1+): Execute steps guided by the plan.
+        Tools are called natively by Claude via MCP.
+        """
+        advisor = ActionAdvisor(self._catalog)
         tracker = TokenTracker()
         llm.reset_session()
 
+        # Register MCP tools
+        if self._mcp_server_name and self._mcp_command:
+            await llm.setup_tools(self._mcp_server_name, self._mcp_command)
+
+        try:
+            return await self._run_loop(task, llm, advisor, tracker, max_turns)
+        finally:
+            await llm.cleanup_tools()
+
+    async def _run_loop(
+        self,
+        task: str,
+        llm: LLMProvider,
+        advisor: ActionAdvisor,
+        tracker: TokenTracker,
+        max_turns: int,
+    ) -> ExecutionContext:
         ctx = ExecutionContext(task=task)
         messages: list[dict[str, Any]] = [{"role": "user", "content": task}]
 
-        for turn in range(max_turns):
+        # ── Phase 1: Plan generation (turn 0) ──
+        plan_prompt = advisor.build_plan_prompt()
+        plan_schema = advisor.build_plan_schema()
+        plan_response = await llm.call(messages, plan_prompt, plan_schema)
+
+        parsed_plan = plan_response.tool_input or {}
+        ctx.plan = parsed_plan.get("plan", [])
+        tracker.record("plan", plan_response.usage)
+        ctx.turn_count = 1
+
+        logger.info("Plan generated: %s", ctx.plan)
+
+        # ── Phase 2: Execution (turns 1+) ──
+        for turn in range(1, max_turns):
             ctx.turn_count = turn + 1
 
             # Build per-turn instructions
-            if turn == 0:
+            if turn == 1 and not ctx.steps:
                 instructions = advisor.build_system_prompt()
             else:
                 instructions = advisor.build_recommendation(
-                    last_type=ctx.steps[-1].action_type,
+                    last_type=ctx.steps[-1].action_type if ctx.steps else "plan",
                     history=ctx.steps,
+                    plan=ctx.plan,
+                    plan_cursor=ctx.plan_cursor,
                 )
 
             schema = advisor.build_response_schema()
@@ -66,47 +109,36 @@ class Engine:
             action_type = parsed.get("action_type", "unknown")
             thinking = parsed.get("thinking", "")
             response_text = parsed.get("response", "")
+
             is_done = parsed.get("is_done", False) or action_type == "done"
 
             # Track cost
             tracker.record(action_type, response.usage)
 
-            # Check if LLM followed recommendation
-            if ctx.steps:
-                prev_suggestions = self._catalog.get_suggestions(ctx.steps[-1].action_type)
-                followed = action_type in prev_suggestions if prev_suggestions else True
-            else:
-                prev_suggestions = []
-                followed = True
+            # Plan adherence: check if action matches plan expectation
+            planned_type = None
+            if ctx.plan and ctx.plan_cursor < len(ctx.plan):
+                planned_type = ctx.plan[ctx.plan_cursor].get("action_type")
 
-            # Execute tool if requested
-            tool_name = parsed.get("tool_name")
-            tool_args = parsed.get("tool_args", {})
-            tool_result = None
+            # Advance plan cursor: always advance (plan is a guide, not a gate)
+            if ctx.plan and ctx.plan_cursor < len(ctx.plan):
+                ctx.plan_cursor += 1
 
-            if tool_name and tool_name != "none":
-                tool_result = self._exec_tool(tool_name, tool_args or {})
-                messages.append({
-                    "role": "user",
-                    "content": f"[Tool: {tool_name}] Result: {tool_result}",
-                })
-
-            # Record step
+            # Record step — tool_calls come from the LLM response (MCP native)
             step = ActionStep(
                 action_type=action_type,
                 thinking=thinking,
                 response=response_text,
-                tool_name=tool_name if tool_name and tool_name != "none" else None,
-                tool_args=tool_args if tool_name and tool_name != "none" else None,
-                tool_result=tool_result,
-                recommendation=prev_suggestions,
-                followed_recommendation=followed,
+                tool_calls=response.tool_calls,
+                planned_type=planned_type,
             )
             ctx.steps.append(step)
 
             logger.info(
-                "Turn %d: action_type=%s, tool=%s, followed=%s, done=%s",
-                turn + 1, action_type, tool_name, followed, is_done,
+                "Turn %d: action=%s, planned=%s, matched=%s, tools=%d, done=%s",
+                turn + 1, action_type, planned_type,
+                action_type == planned_type if planned_type else True,
+                len(response.tool_calls), is_done,
             )
 
             if is_done:
@@ -115,16 +147,3 @@ class Engine:
         # Attach cost stats
         ctx.cost_stats = tracker.stats
         return ctx
-
-    def _exec_tool(self, name: str, args: dict[str, Any]) -> str:
-        """Execute a registered tool and return result as string."""
-        tool = self._tools.get(name)
-        if tool is None:
-            return f"Error: unknown tool '{name}'"
-        if tool.func is None:
-            return f"Error: tool '{name}' has no implementation"
-        try:
-            result = tool.func(**args)
-            return str(result)
-        except Exception as e:
-            return f"Error calling {name}: {e}"

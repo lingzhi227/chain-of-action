@@ -1,64 +1,120 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 from src.core.action_type import ActionCatalog
 from src.core.context import ActionStep
 
 
-@dataclass
-class ToolDef:
-    """Definition of a registered tool."""
-    name: str
-    description: str
-    func: Any = None  # Callable, set at registration
-
-
 class ActionAdvisor:
-    """Builds system prompts and per-turn recommendations."""
+    """Builds system prompts and per-turn recommendations.
 
-    def __init__(self, catalog: ActionCatalog, tools: dict[str, ToolDef]) -> None:
+    Tools are handled natively by Claude CLI via MCP — the advisor
+    only needs the action catalog for guidance prompts.
+    """
+
+    def __init__(self, catalog: ActionCatalog) -> None:
         self._catalog = catalog
-        self._tools = tools
 
     def build_system_prompt(self) -> str:
-        """Build the initial system prompt describing action types, tools, and output format."""
+        """Build the initial system prompt describing action types and output format."""
         catalog_section = self._catalog.to_prompt_section()
 
-        tool_lines = ["## Available Tools", ""]
-        if self._tools:
-            for t in self._tools.values():
-                tool_lines.append(f"- **{t.name}**: {t.description}")
-        else:
-            tool_lines.append("No tools available.")
-        tool_section = "\n".join(tool_lines)
-
         return (
-            "You are solving a task step by step. At each step, you choose an action type "
-            "that best describes what you're doing.\n\n"
+            "You are solving a task step by step, following a plan. "
+            "You must execute exactly ONE step per turn.\n\n"
             f"{catalog_section}\n\n"
-            f"{tool_section}\n\n"
             "## How It Works\n"
-            "1. You self-classify your action by setting `action_type` to any type from the catalog "
-            "(or invent a new one if needed).\n"
-            "2. All tools are always available — use whichever you need.\n"
-            "3. Recommendations are suggestions only. You have full agency.\n"
-            "4. Set `is_done: true` when the task is complete (or use action_type `done`).\n"
+            "1. Each turn, you receive ONE step from the plan. Execute ONLY that step.\n"
+            "2. Set `action_type` to match the plan's expected action type.\n"
+            "3. Use MCP tools when you need to compute or verify.\n"
+            "4. Do NOT skip ahead or combine multiple plan steps into one turn.\n"
+            "5. Only set `is_done: true` when you reach the final `done` step of the plan.\n"
         )
 
-    def build_recommendation(self, last_type: str, history: list[ActionStep]) -> str:
-        """Build a per-turn recommendation based on last action type and history."""
-        suggestions = self._catalog.get_suggestions(last_type)
+    def build_plan_prompt(self) -> str:
+        """Turn 0: ask LLM to generate an execution plan from the catalog."""
+        catalog_section = self._catalog.to_prompt_section()
+
+        return (
+            "You are solving a task step by step. First, create an execution plan.\n\n"
+            f"{catalog_section}\n\n"
+            "## Your Task\n"
+            "Analyze the task and create a plan: an ordered list of steps.\n"
+            "Each step has an `action_type` from the catalog and a short `description` "
+            "explaining what specifically to do in that step.\n"
+            "You may repeat action types (e.g. multiple `compute` steps with different descriptions).\n"
+            "The plan must end with a step whose action_type is `done`.\n"
+        )
+
+    def build_plan_schema(self) -> dict[str, Any]:
+        """JSON schema for plan generation (turn 0)."""
+        return {
+            "type": "object",
+            "properties": {
+                "thinking": {
+                    "type": "string",
+                    "description": "Your analysis of what steps are needed.",
+                },
+                "plan": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action_type": {
+                                "type": "string",
+                                "description": (
+                                    f"Action type. Available: {', '.join(self._catalog.type_names())}."
+                                ),
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "What specifically to do in this step.",
+                            },
+                        },
+                        "required": ["action_type", "description"],
+                    },
+                    "description": (
+                        "Ordered list of plan steps. "
+                        "Must end with a step whose action_type is 'done'."
+                    ),
+                },
+            },
+            "required": ["thinking", "plan"],
+        }
+
+    def build_recommendation(
+        self,
+        last_type: str,
+        history: list[ActionStep],
+        plan: list[dict[str, str]] | None = None,
+        plan_cursor: int = 0,
+    ) -> str:
+        """Build per-turn recommendation. If plan exists, show plan progress."""
         parts = []
 
-        if suggestions:
-            parts.append(
-                f"Your last action was [{last_type}]. "
-                f"Recommended next: [{', '.join(suggestions)}]."
-            )
+        if plan:
+            total = len(plan)
+            current_idx = min(plan_cursor, total - 1)
+            step_info = plan[current_idx]
+            expected_type = step_info.get("action_type", "unknown")
+            expected_desc = step_info.get("description", "")
+            is_final = expected_type == "done"
+
+            parts.append(f"Step {current_idx + 1}/{total}.")
+            parts.append(f"Execute ONLY: [{expected_type}] — {expected_desc}." if expected_desc else f"Execute ONLY: [{expected_type}].")
+            if not is_final:
+                parts.append("Do NOT combine steps. Do NOT set is_done. One step only.")
         else:
-            parts.append(f"Your last action was [{last_type}].")
+            # Fallback to old behavior (no plan)
+            suggestions = self._catalog.get_suggestions(last_type)
+            if suggestions:
+                parts.append(
+                    f"Your last action was [{last_type}]. "
+                    f"Recommended next: [{', '.join(suggestions)}]."
+                )
+            else:
+                parts.append(f"Your last action was [{last_type}].")
 
         # Count consecutive same-type actions
         if len(history) >= 3:
@@ -72,51 +128,33 @@ class ActionAdvisor:
         return " ".join(parts)
 
     def build_response_schema(self) -> dict[str, Any]:
-        """Build the JSON schema for structured LLM responses."""
-        properties: dict[str, Any] = {
-            "action_type": {
-                "type": "string",
-                "description": (
-                    "The type of action you are performing. "
-                    f"Known types: {', '.join(self._catalog.type_names())}. "
-                    "You may also use a custom type if none fit."
-                ),
-            },
-            "thinking": {
-                "type": "string",
-                "description": "Your internal reasoning about what to do.",
-            },
-            "response": {
-                "type": "string",
-                "description": "Your response text or the result of your work.",
-            },
-        }
-        required = ["action_type", "thinking", "response"]
+        """Build the JSON schema for structured LLM responses.
 
-        if self._tools:
-            tool_names = list(self._tools.keys()) + ["none"]
-            properties["tool_name"] = {
-                "type": "string",
-                "enum": tool_names,
-                "description": (
-                    "Name of the tool to call, or 'none' if no tool is needed. "
-                    f"Available: {', '.join(self._tools.keys())}"
-                ),
-            }
-            properties["tool_args"] = {
-                "type": "object",
-                "description": "Arguments to pass to the selected tool. Empty if tool_name is 'none'.",
-            }
-            required.extend(["tool_name", "tool_args"])
-
-        properties["is_done"] = {
-            "type": "boolean",
-            "description": "Set to true when the task is fully complete.",
-        }
-        required.append("is_done")
-
+        Tools are NOT in the schema — Claude calls MCP tools natively.
+        """
         return {
             "type": "object",
-            "properties": properties,
-            "required": required,
+            "properties": {
+                "action_type": {
+                    "type": "string",
+                    "description": (
+                        "The type of action you are performing. "
+                        f"Known types: {', '.join(self._catalog.type_names())}. "
+                        "You may also use a custom type if none fit."
+                    ),
+                },
+                "thinking": {
+                    "type": "string",
+                    "description": "Your internal reasoning about what to do.",
+                },
+                "response": {
+                    "type": "string",
+                    "description": "Your response text or the result of your work.",
+                },
+                "is_done": {
+                    "type": "boolean",
+                    "description": "Set to true when the task is fully complete.",
+                },
+            },
+            "required": ["action_type", "thinking", "response", "is_done"],
         }
