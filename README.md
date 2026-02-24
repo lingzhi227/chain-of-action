@@ -2,7 +2,7 @@
 
 Soft action guidance framework for LLM agents. The LLM self-classifies its behavior into action types and receives recommendations for what to do next — but is never forced. All tools remain available at every step.
 
-Counterpart to [finite-state-agent](https://github.com/lingzhi227/action-chain) (hard FSM). Same problem, opposite philosophy.
+Counterpart to [finite-state-agent](https://github.com/lingzhi227/finite-state-agent) (hard FSM). Same problem, opposite philosophy.
 
 ## Why
 
